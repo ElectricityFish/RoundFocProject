@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<workspace>
+  <project><path>$WS_DIR$\boot_cm0plus.ewp</path></project>
+  <project><path>$WS_DIR$\round_foc_cm4.ewp</path></project>
+  <batchBuild>
+    <batchDefinition>
+      <name>Debug</name>
+      <member><project>boot_cm0plus</project><configuration>Debug</configuration></member>
+      <member><project>round_foc_cm4</project><configuration>Debug</configuration></member>
+    </batchDefinition>
+  </batchBuild>
+</workspace>
