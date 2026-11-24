@@ -1164,6 +1164,36 @@
     <file>
       <name>$PROJ_DIR$\..\app\main_cm4.c</name>
     </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\board.c</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\board.h</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\motor.c</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\motor.h</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\console.c</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\console.h</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\cal_store.c</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\cal_store.h</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\work_flash.c</name>
+    </file>
+    <file>
+      <name>$PROJ_DIR$\..\app\work_flash.h</name>
+    </file>
   </group>
   <group>
     <name>platform</name>
