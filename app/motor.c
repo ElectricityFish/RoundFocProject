@@ -3,8 +3,6 @@
 #include "cal_store.h"
 #include <stdlib.h>
 
-#define ALIGN_TICKS     TICKS_MS(400)
-#define STEP_TICKS      TICKS_MS(150)
 #define SETTLED_WINDOW  TICKS_MS(20)
 #define STALL_TICKS     TICKS_MS(500)
 #define MECH_STEP       (ENCODER_COUNTS / (6 * MOTOR_POLE_PAIRS))
@@ -130,10 +128,10 @@ static void calibration_sample(uint32_t tick, uint16_t raw)
 {
     unsigned point = sweep.point;
     uint32_t elapsed = tick - sweep.start;
-    uint32_t dwell = point == 0 ? ALIGN_TICKS : STEP_TICKS;
+    uint32_t dwell = point == 0 ? CAL_ALIGN_TICKS : CAL_STEP_TICKS;
     unsigned duty = CAL_DUTY_PERMILLE;
-    if (point == 0 && elapsed < TICKS_MS(100))
-        duty = 1u + (CAL_DUTY_PERMILLE - 1u) * elapsed / TICKS_MS(100);
+    if (point == 0 && elapsed < CAL_RAMP_TICKS)
+        duty = 1u + (CAL_DUTY_PERMILLE - 1u) * elapsed / CAL_RAMP_TICKS;
     drive(cal_vector(point), duty);
 
     if (elapsed < dwell - SETTLED_WINDOW) return;

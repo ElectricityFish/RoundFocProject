@@ -33,6 +33,13 @@ static const uint8_t drive_pair[6][2] = {{0,1}, {0,2}, {1,2}, {1,0}, {2,0}, {2,1
 static unsigned active_vector = 6, active_duty;
 static uint32_t pwm_counts;
 
+/* CM4 IAR Watch: counts since reset and the last complete 16-bit SPI replies. */
+static volatile struct {
+    uint32_t valid_samples, transfer_errors, frame_errors, diagnostic_errors;
+    uint16_t diaagc, anglecom, errfl;
+    bool errfl_received;
+} encoder_diag;
+
 void bridge_off(void)
 {
     /* High-side GPIO latches always contain zero. Remove the PWM route first. */
@@ -150,15 +157,21 @@ static bool spi_word(uint16_t command, uint16_t *response)
     while (ok && (Cy_SCB_SPI_GetNumInRxFifo(SCB3) == 0 || Cy_SCB_SPI_IsBusBusy(SCB3))) {
         ok = DWT->CYCCNT - start < SystemCoreClock / 25000u; /* 40 us per frame */
     }
-    if (ok) *response = (uint16_t)Cy_SCB_SPI_Read(SCB3);
+    if (ok) {
+        *response = (uint16_t)Cy_SCB_SPI_Read(SCB3);
+    } else {
+        ++encoder_diag.transfer_errors;
+        /* SDL 8.7.0 SPI_Disable clears all of CTRL, including MODE, MEM_WIDTH and OVS. */
+        SCB3->unCTRL.stcField.u1ENABLED = 0u;
+    }
+    Cy_SysLib_DelayUs(1); /* tH >= half an SCLK period after the last falling edge. */
     Cy_GPIO_Set(GPIO_PRT13, 3);
-    Cy_SysLib_DelayUs(1);
     if (!ok) {
-        Cy_SCB_SPI_Disable(SCB3, NULL);
         Cy_SCB_SPI_ClearRxFifo(SCB3);
         Cy_SCB_SPI_ClearTxFifo(SCB3);
         Cy_SCB_SPI_Enable(SCB3);
     }
+    Cy_SysLib_DelayUs(1); /* CSn high between commands. */
     return ok;
 }
 
@@ -179,11 +192,22 @@ bool encoder_read(uint16_t *angle)
     /* Even-parity read commands: DIAAGC (0x3ffc), ANGLECOM (0x3fff), NOP (0). */
     if (!spi_word(0xFFFCu, &discard) || !spi_word(0xFFFFu, &diagnostic) ||
         !spi_word(0xC000u, &position)) return false;
+    encoder_diag.diaagc = diagnostic;
+    encoder_diag.anglecom = position;
     if (!response_valid(diagnostic) || !response_valid(position)) {
-        (void)spi_word(0x4001u, &discard); /* Read ERRFL to clear a latched command error. */
+        ++encoder_diag.frame_errors;
+        /* Reading ERRFL clears it. Its reply arrives during the following NOP. */
+        uint16_t errfl;
+        bool received = spi_word(0x4001u, &discard) && spi_word(0xC000u, &errfl);
+        if (received) encoder_diag.errfl = errfl;
+        encoder_diag.errfl_received = received;
         return false;
     }
-    if ((diagnostic & 0x0F00u) != 0x0100u) return false; /* LF set, COF/MAGH/MAGL clear */
+    if ((diagnostic & 0x0F00u) != 0x0100u) { /* LF set, COF/MAGH/MAGL clear */
+        ++encoder_diag.diagnostic_errors;
+        return false;
+    }
+    ++encoder_diag.valid_samples;
     *angle = position & 0x3FFFu;
     return true;
 }

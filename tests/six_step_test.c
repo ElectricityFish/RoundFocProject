@@ -117,14 +117,15 @@ static void expect_report_code(int state)
     assert(last && atoi(last + 1) == state);
 }
 
-/* Model rotor following the actual energized vector. The mechanical move is limited
-   per sample, so the controller sees settling before it measures each position. */
+/* One encoder count per three ticks gives a nominal 8.57-degree step about 293 ms
+   to settle, exercising a rotor that takes longer than the old 150 ms dwell. */
 static int simulate_cal(int origin, int direction, unsigned poles)
 {
     int position = origin, field_steps = 0, previous = 0;
+    const unsigned sweep_ticks = CAL_ALIGN_TICKS + 12u * CAL_STEP_TICKS;
     command("cal");
     assert(motor_telemetry().state == MOTOR_CALIBRATING);
-    for (unsigned i = 0; i < TICKS_MS(3000) && motor_telemetry().state == MOTOR_CALIBRATING; ++i) {
+    for (unsigned i = 0; i < sweep_ticks && motor_telemetry().state == MOTOR_CALIBRATING; ++i) {
         if (vector < 6) {
             int change = ((int)vector - previous + 6) % 6;
             assert(change == 0 || change == 1 || change == 5);
@@ -132,10 +133,8 @@ static int simulate_cal(int origin, int direction, unsigned poles)
             previous = (int)vector;
         }
         int target = origin + direction * (field_steps * ENCODER_COUNTS) / (6 * (int)poles);
-        int delta = target - position;
-        if (delta > 20) delta = 20;
-        if (delta < -20) delta = -20;
-        position += delta;
+        if (i % 3u == 0 && position != target)
+            position += target > position ? 1 : -1;
         sample(position);
     }
     assert(vector == 6);
@@ -193,7 +192,8 @@ static void test_direction(int direction, int origin)
     assert(!duty && motor_telemetry().state == MOTOR_READY && erase_count == before);
 
     command("cal");
-    sample(position);
+    for (unsigned i = 0; i < CAL_RAMP_TICKS / 2u; ++i) sample(position);
+    assert(vector == 0 && duty > 1u && duty < CAL_DUTY_PERMILLE);
     command("stop");
     assert(!duty && erase_count == before);
     expect_cal(cal);
@@ -219,7 +219,10 @@ static void test_direction(int direction, int origin)
     assert(!duty && motor_telemetry().state == MOTOR_TIMING_FAULT);
     command("stop");
     command("cal");
-    for (unsigned i = 0; i < TICKS_MS(600); ++i) sample(position); /* locked rotor */
+    /* Hold the rotor fixed until the first displaced vector has had its full dwell. */
+    for (unsigned i = 1; i < CAL_ALIGN_TICKS + CAL_STEP_TICKS; ++i) sample(position);
+    assert(motor_telemetry().state == MOTOR_CALIBRATING && vector == 1 && duty == CAL_DUTY_PERMILLE);
+    sample(position);
     assert(!duty && motor_telemetry().state == MOTOR_CAL_FAILED && erase_count == before);
     command("stop");
     simulate_cal(position, direction, 8);

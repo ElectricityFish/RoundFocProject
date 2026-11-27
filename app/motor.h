@@ -9,7 +9,10 @@
 #define ENCODER_COUNTS         16384
 #define CONTROL_HZ             4000u
 #define TICKS_MS(ms)           ((ms) * (CONTROL_HZ / 1000u))
-#define CAL_DUTY_PERMILLE      30u
+#define CAL_DUTY_PERMILLE      70u
+#define CAL_RAMP_TICKS         TICKS_MS(200u)
+#define CAL_ALIGN_TICKS        TICKS_MS(800u)
+#define CAL_STEP_TICKS         TICKS_MS(400u)
 #define MAX_DUTY_PERMILLE      150u
 
 typedef struct {
