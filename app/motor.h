@@ -13,7 +13,7 @@
 #define CAL_RAMP_TICKS         TICKS_MS(200u)
 #define CAL_ALIGN_TICKS        TICKS_MS(800u)
 #define CAL_STEP_TICKS         TICKS_MS(400u)
-#define MAX_DUTY_PERMILLE      150u
+#define MAX_DUTY_PERMILLE      700u
 
 typedef struct {
     uint16_t zero_electrical;  /* encoder counts per electrical revolution */

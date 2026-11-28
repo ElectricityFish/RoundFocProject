@@ -161,7 +161,8 @@ static void test_direction(int direction, int origin)
     assert(!duty && motor_telemetry().state == MOTOR_READY);
 
     command("run 5x");
-    command("run 15.1");
+    expect_report_code(-6);
+    command("run 70.1");
     expect_report_code(-6);
     assert(motor_telemetry().state == MOTOR_READY);
     console_input('r', tick);
@@ -188,6 +189,19 @@ static void test_direction(int direction, int origin)
         }
         assert(changes == 42 && duty == 50 && motor_telemetry().rpm == 234);
     }
+    command("run 70");
+    for (unsigned i = 0; i < TICKS_MS(1300); ++i) { /* 5% to 70% at 0.1% per 2 ms */
+        position += direction * 16;
+        sample(position);
+    }
+    assert(motor_telemetry().state == MOTOR_RUNNING && duty == 700);
+    command("run 69.9%");
+    sample(position);
+    assert(duty == 699);
+    command("run 70.1");
+    expect_report_code(-6);
+    sample(position);
+    assert(duty == 699);
     command("stop");
     assert(!duty && motor_telemetry().state == MOTOR_READY && erase_count == before);
 
