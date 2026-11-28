@@ -16,7 +16,7 @@ int main(void)
     if (!board_init() || SysTick_Config(SystemCoreClock / CONTROL_HZ) != 0u) {
         bridge_off();
         for (;;) {
-            char fault[] = "0.0,0,0,-7\r\n";
+            char fault[] = "0.0,0,0,-7,0,0.0\r\n";
             board_uart_send(fault, sizeof(fault) - 1u);
             Cy_SysLib_Delay(100);
         }

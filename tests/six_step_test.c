@@ -113,8 +113,15 @@ static void command(const char *text)
 static void expect_report_code(int state)
 {
     console_report();
-    const char *last = strrchr(report, ',');
-    assert(last && atoi(last + 1) == state);
+    long rpm;
+    unsigned v, target, whole, tenth;
+    int code, end = -1;
+    assert(sscanf(report, "%*u.%*u,%ld,%u,%d,%u,%u.%u%n",
+                  &rpm, &v, &code, &target, &whole, &tenth, &end) == 6);
+    MotorTelemetry t = motor_telemetry();
+    assert(end >= 0 && !strcmp(report + end, "\r\n") && code == state);
+    assert(rpm == t.rpm && target == t.target_rpm && v == t.vector);
+    assert(tenth < 10 && whole * 10u + tenth == duty && t.duty_permille == duty);
 }
 
 /* One encoder count per three ticks gives a nominal 8.57-degree step about 293 ms
@@ -254,11 +261,136 @@ static void test_direction(int direction, int origin)
     printf("PASS encoder direction %+d, wrap, 64 turns, stop, faults and optional recalibration\n", direction);
 }
 
+static double shaft_counts;
+static int shaft_direction;
+
+static void turn_tick(double rpm)
+{
+    shaft_counts += shaft_direction * rpm * ENCODER_COUNTS / (60.0 * CONTROL_HZ);
+    sample((int)shaft_counts);
+}
+
+static void turn_for(int rpm, unsigned ms)
+{
+    for (unsigned i = 0; i < TICKS_MS(ms); ++i) turn_tick(rpm);
+}
+
+/* A first-order motor with a speed loss under load, driven by actual bridge duty. */
+static double run_plant(double rpm, int load_rpm, unsigned ms)
+{
+    for (unsigned i = 0; i < TICKS_MS(ms); ++i) {
+        double equilibrium = 12.0 * duty - load_rpm;
+        if (equilibrium < 0) equilibrium = 0;
+        rpm += (equilibrium - rpm) / TICKS_MS(120);
+        turn_tick(rpm);
+    }
+    return rpm;
+}
+
+static void test_speed(int direction)
+{
+    memset(flash, 0, sizeof(flash));
+    motor_init();
+    tick = UINT32_MAX - TICKS_MS(100);
+    shaft_counts = 0;
+    shaft_direction = direction;
+    sample(0);
+    command("speed 3000");
+    expect_report_code(-6);
+    assert(motor_telemetry().state == MOTOR_NEEDS_CAL && !duty);
+    Calibration cal = {0, (int8_t)direction};
+    assert(cal_store_save(&cal));
+    motor_init();
+    command("speed 3000"); /* first angle after reset is still missing */
+    expect_report_code(-1);
+    sample(0);
+    command("speed 5080");
+    expect_report_code(-6);
+    command("speed 3000.5");
+    expect_report_code(-6);
+
+    command("pi 0 0");
+    command("speed 120");
+    turn_for(0, 180);
+    assert(duty == 50); /* stationary breakaway assist */
+    turn_for(120, 200);
+    assert(duty == 9 && motor_telemetry().target_rpm == 120);
+    command("speed 3000");
+    turn_for(3000, 640);
+    assert(duty == 248 && abs((int)motor_telemetry().rpm - 3000) <= 1);
+    expect_report_code(MOTOR_RUNNING);
+    command("speed 3500");
+    turn_for(3500, 180);
+    assert(duty == 313);
+    command("pi 0.005 0");
+    turn_for(3000, 120);
+    assert(duty == 338);
+    command("pi 0 0.0001"); /* Reject the whole pair, including the first valid gain. */
+    expect_report_code(-6);
+    command("pi 0 1x");
+    expect_report_code(-6);
+    turn_for(3000, 60);
+    assert(duty == 338);
+
+    command("pi 0 0.500");
+    command("speed 5079");
+    turn_for(2607, 1800); /* rate-limited, then saturated, with sustained positive error */
+    assert(duty == MAX_DUTY_PERMILLE);
+    command("speed 2607");
+    turn_for(2607, 60);
+    assert(duty >= 200 && duty <= 201); /* No stored error from ramp or saturation. */
+    command("pi 0.500 0");
+    turn_for(4000, 80);
+    assert(!duty && vector == 6 && motor_telemetry().target_rpm == 2607);
+    expect_report_code(MOTOR_RUNNING); /* coasting is still speed mode */
+    command("run 7.5%");
+    turn_for(1000, 200);
+    assert(duty == 75 && !motor_telemetry().target_rpm);
+    command("speed 3428");
+    turn_for(3428, 720);
+    assert(duty >= 300 && duty <= 305);
+    command("speed 0");
+    assert(!duty && !motor_telemetry().target_rpm);
+    expect_report_code(MOTOR_READY);
+
+    command("speed 1000");
+    for (unsigned i = 0; i < TICKS_MS(520); ++i) {
+        turn_tick(0);
+        if (i % TICKS_MS(80) == 0) command("speed 1000");
+    }
+    assert(motor_telemetry().state == MOTOR_STALL && !motor_telemetry().target_rpm && !duty);
+    command("stop");
+    command("speed 3000");
+    turn_for(1500, 80);
+    motor_sample(++tick, false, 0);
+    assert(motor_telemetry().state == MOTOR_SENSOR_FAULT && !motor_telemetry().target_rpm && !duty);
+
+    motor_init(); /* restores the default PI and clears feedback and integral */
+    turn_tick(0);
+    command("speed 3000");
+    double rpm = run_plant(0, 0, 4500);
+    assert(abs((int)rpm - 3000) < 10 && duty >= 245 && duty <= 255);
+    rpm = run_plant(rpm, 400, 4500);
+    assert(abs((int)rpm - 3000) < 10 && duty >= 280 && duty <= 286);
+    command("speed 3500");
+    rpm = run_plant(rpm, 400, 4500);
+    assert(abs((int)rpm - 3500) < 10);
+    command("speed 3000");
+    rpm = run_plant(rpm, 400, 4500);
+    assert(abs((int)rpm - 3000) < 10);
+    command("run 0");
+    assert(!duty && !motor_telemetry().target_rpm);
+    expect_report_code(MOTOR_READY);
+    printf("PASS speed feedback %+d: feedforward, PI, limits, coasting, load steps, modes and telemetry\n", direction);
+}
+
 int main(void)
 {
     test_flash();
     test_direction(1, 16372);
     test_direction(-1, 23);
+    test_speed(1);
+    test_speed(-1);
     puts("All six-step regression checks passed.");
     return 0;
 }

@@ -6,13 +6,19 @@
 #define SETTLED_WINDOW  TICKS_MS(20)
 #define STALL_TICKS     TICKS_MS(500)
 #define MECH_STEP       (ENCODER_COUNTS / (6 * MOTOR_POLE_PAIRS))
+#define DUTY_STEP_TICKS TICKS_MS(2)
+#define START_DUTY      50u   /* 5% observed breakaway duty at 16.8 V, no load */
+#define DEFAULT_SPEED_KP_MILLI 14u  /* 0.014 duty percentage points/rpm */
+#define DEFAULT_SPEED_KI_MILLI 14u  /* 0.014 duty percentage points/(rpm*s) */
 
 static MotorTelemetry output;
 static Calibration calibration;
 static bool calibrated, have_angle;
 static uint32_t last_sample, speed_start, last_motion, ramp_tick;
 static int32_t speed_counts, forward_counts;
-static unsigned target_duty, applied_duty;
+static unsigned target_duty;
+static float speed_kp, speed_ki, speed_integral; /* output units are 0.1% duty */
+static bool speed_starting;
 
 /* Fixed vectors 0,1,2,3,4,5,0 then 5,4,3,2,1,0. Each point is sampled after settling. */
 static struct {
@@ -37,6 +43,11 @@ static void stop_as(MotorState state)
 {
     bridge_off();
     output.vector = 0;
+    output.duty_permille = 0;
+    output.target_rpm = 0;
+    target_duty = 0;
+    speed_integral = 0.0f;
+    speed_starting = false;
     output.state = state;
 }
 
@@ -47,8 +58,9 @@ void motor_stop(void)
 
 void motor_init(void)
 {
-    bridge_off();
     output = (MotorTelemetry){0};
+    stop_as(MOTOR_NEEDS_CAL);
+    (void)motor_set_pi(DEFAULT_SPEED_KP_MILLI, DEFAULT_SPEED_KI_MILLI);
     have_angle = false;
     CalRead status = cal_store_load(&calibration);
     calibrated = status == CAL_VALID;
@@ -73,25 +85,104 @@ bool motor_calibrate(uint32_t tick)
     return true;
 }
 
-bool motor_run(uint32_t tick, unsigned duty)
+static bool begin_run(uint32_t tick)
 {
-    if (duty == 0) { motor_stop(); return true; }
-    if (duty > MAX_DUTY_PERMILLE || !calibrated || !fresh_angle(tick) ||
+    if (!calibrated || !fresh_angle(tick) ||
         (output.state != MOTOR_READY && output.state != MOTOR_RUNNING)) return false;
     if (output.state != MOTOR_RUNNING) {
         last_motion = ramp_tick = tick;
         forward_counts = 0;
-        applied_duty = 1;
+        output.state = MOTOR_RUNNING;
     }
-    target_duty = duty;
-    output.state = MOTOR_RUNNING;
     return true;
+}
+
+bool motor_run(uint32_t tick, unsigned duty)
+{
+    if (duty == 0) { motor_stop(); return true; }
+    if (duty > MAX_DUTY_PERMILLE || !begin_run(tick)) return false;
+    output.target_rpm = 0;
+    speed_integral = 0.0f;
+    speed_starting = false;
+    target_duty = duty;
+    return true;
+}
+
+bool motor_speed(uint32_t tick, unsigned rpm)
+{
+    if (rpm == 0) { motor_stop(); return true; }
+    bool from_idle = output.state == MOTOR_READY;
+    if (rpm > MAX_SPEED_RPM || !begin_run(tick)) return false;
+    if (output.target_rpm == 0) {
+        speed_starting = from_idle;
+        speed_integral = 0.0f;
+        target_duty = output.duty_permille; /* Hold until the next measured RPM. */
+    }
+    output.target_rpm = rpm;
+    return true;
+}
+
+bool motor_set_pi(unsigned kp_milli, unsigned ki_milli)
+{
+    if (kp_milli > MAX_PI_GAIN_MILLI || ki_milli > MAX_PI_GAIN_MILLI) return false;
+    speed_kp = (float)kp_milli / 100.0f;
+    speed_ki = (float)ki_milli / 100.0f;
+    if (ki_milli == 0) speed_integral = 0.0f;
+    return true;
+}
+
+static float clip(float value, float low, float high)
+{
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+
+static float feedforward_duty(unsigned rpm)
+{
+    /* 16.8 V no-load measurements. The span below 2607 rpm is an estimate. */
+    static const struct { unsigned rpm, duty; } points[] = {
+        {0, 0}, {2607, 200}, {3428, 300}, {3998, 400}, {4409, 500},
+        {4761, 600}, {MAX_SPEED_RPM, MAX_DUTY_PERMILLE}
+    };
+    for (unsigned i = 1; i < sizeof(points) / sizeof(points[0]); ++i) {
+        if (rpm <= points[i].rpm) {
+            float fraction = (float)(rpm - points[i-1].rpm) / (float)(points[i].rpm - points[i-1].rpm);
+            return (float)points[i-1].duty + fraction * (float)(points[i].duty - points[i-1].duty);
+        }
+    }
+    return MAX_DUTY_PERMILLE;
+}
+
+static void update_speed_duty(uint32_t window)
+{
+    float error = (float)output.target_rpm - (float)output.rpm;
+    float base = feedforward_duty(output.target_rpm) + speed_kp * error;
+    float demand = base + speed_integral;
+    float change = speed_ki * error * ((float)window / (float)CONTROL_HZ);
+    float floor = speed_starting && error > 0.0f ? (float)START_DUTY : 0.0f;
+    /* Integrate only as far as the bridge can follow in this speed window.
+       An error of the opposite sign can always unwind a saturated output. */
+    float ceiling = clip((float)output.duty_permille + (float)window / (float)DUTY_STEP_TICKS,
+                         0.0f, MAX_DUTY_PERMILLE);
+    if (change > 0.0f && demand < ceiling)
+        speed_integral += clip(change, 0.0f, ceiling - demand);
+    else if (change < 0.0f && demand > floor)
+        speed_integral += clip(change, floor - demand, 0.0f);
+    speed_integral = clip(speed_integral, -(float)MAX_DUTY_PERMILLE, MAX_DUTY_PERMILLE);
+    target_duty = (unsigned)(clip(base + speed_integral, floor, MAX_DUTY_PERMILLE) + 0.5f);
 }
 
 static void drive(unsigned vector, unsigned duty)
 {
-    bridge_drive(vector, duty);
-    output.vector = (uint8_t)(vector + 1);
+    if (duty == 0) {
+        if (output.vector != 0) bridge_off();
+        output.vector = 0;
+    } else {
+        bridge_drive(vector, duty);
+        output.vector = (uint8_t)(vector + 1);
+    }
+    output.duty_permille = duty;
 }
 
 static unsigned cal_vector(unsigned point)
@@ -181,17 +272,19 @@ static void run_sample(uint32_t tick, uint16_t raw, int delta)
     if (forward_counts >= ENCODER_COUNTS / 128) { /* 2.8 mechanical degrees of net progress */
         forward_counts = 0;
         last_motion = tick;
+        speed_starting = false;
     }
     if (tick - last_motion >= STALL_TICKS) { stop_as(MOTOR_STALL); return; }
-    uint32_t steps = (tick - ramp_tick) / TICKS_MS(2);
-    ramp_tick += steps * TICKS_MS(2);
-    if (applied_duty < target_duty) applied_duty += steps;
-    if (applied_duty > target_duty) applied_duty = target_duty;
+    uint32_t steps = (tick - ramp_tick) / DUTY_STEP_TICKS;
+    ramp_tick += steps * DUTY_STEP_TICKS;
+    unsigned duty = output.duty_permille;
+    if (duty < target_duty) duty = (duty ? duty : 1u) + steps;
+    if (duty > target_duty) duty = target_duty;
     uint16_t electrical = wrap_angle(calibration.direction * MOTOR_POLE_PAIRS * raw -
                                      calibration.zero_electrical);
     /* Nearest stator vector to rotor +90 degrees (vector-0 is the calibration field). */
     unsigned vector = ((uint32_t)electrical * 6u / ENCODER_COUNTS + 2u) % 6u;
-    drive(vector, applied_duty);
+    drive(vector, duty);
 }
 
 void motor_sample(uint32_t tick, bool valid, uint16_t raw)
@@ -221,6 +314,7 @@ void motor_sample(uint32_t tick, bool valid, uint16_t raw)
                                    ((int64_t)window * ENCODER_COUNTS));
             speed_start = tick;
             speed_counts = 0;
+            if (output.target_rpm != 0) update_speed_duty(window);
         }
     }
     last_sample = tick;
